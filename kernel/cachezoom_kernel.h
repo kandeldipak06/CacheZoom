@@ -1,3 +1,6 @@
+//defining commands for ioctl for both reading and writing
+
+
 struct cachezoom_generic_param {
   unsigned long long param_0;
   unsigned long long param_1;
